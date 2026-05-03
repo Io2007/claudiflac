@@ -35,66 +35,7 @@ const QOBUZ_INSTANCES = [
 ];
 let activeQobuzInstance = QOBUZ_INSTANCES[0];
 
-// ─── In-memory track meta cache (title+artist by TIDAL id) ───────────────────
-// Populated at search time, read at stream time. Survives within the same worker instance.
-const TRACK_META_CACHE = new Map();
-const ISRC_MATCH_CACHE = new Map(); // Cache successful ISRC matches: isrc -> { source, matchedId }
-
-function cacheTrackMeta(id, title, artist, isrc) {
-if (!id || !title) return;
-TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null });
-// cap size to avoid unbounded growth in long-lived instances
-if (TRACK_META_CACHE.size > 5000) {
-const firstKey = TRACK_META_CACHE.keys().next().value;
-TRACK_META_CACHE.delete(firstKey);
-}
-}
-
-function getCachedMeta(id) {
-return TRACK_META_CACHE.get(String(id)) || null;
-}
-
-function cacheIsrcMatch(isrc, source, matchedId) {
-if (!isrc || !matchedId) return;
-const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-const key = norm(isrc);
-ISRC_MATCH_CACHE.set(key, { source, matchedId, ts: Date.now() });
-// cap size
-if (ISRC_MATCH_CACHE.size > 2000) {
-const firstKey = ISRC_MATCH_CACHE.keys().next().value;
-ISRC_MATCH_CACHE.delete(firstKey);
-}
-}
-
-function getCachedIsrcMatch(isrc) {
-if (!isrc) return null;
-const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-const key = norm(isrc);
-const cached = ISRC_MATCH_CACHE.get(key);
-if (!cached) return null;
-// Invalidate after 30 days (2592000000 ms) - ISRCs are permanent identifiers
-if (Date.now() - cached.ts > 2592000000) {
-ISRC_MATCH_CACHE.delete(key);
-return null;
-}
-return cached;
-}
-
-// ─── Unified in-memory TTL cache ─────────────────────────────────────────────
-const _cache = new Map();
-function cGet(key) {
-  const v = _cache.get(key);
-  if (!v) return null;
-  if (v.exp && v.exp < Date.now()) { _cache.delete(key); return null; }
-  return v.val;
-}
-function cSet(key, val, ttlSec) {
-  _cache.set(key, { val, exp: ttlSec ? Date.now() + ttlSec * 1000 : null });
-  if (_cache.size > 2000) {
-    let del = Math.floor(_cache.size * 0.2);
-    for (const k of _cache.keys()) { if (del-- <= 0) break; _cache.delete(k); }
-  }
-}
+// ─── Redis-only caching (no in-memory cache) ─────────────────────────────────
 
 // ─── Inflight deduplication ───────────────────────────────────────────────────
 // Two simultaneous requests for the same stream share ONE outbound call.
@@ -107,14 +48,6 @@ async function dedupeCall(key, fn) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function coverUrl(uuid, size) {
-if (!uuid) return undefined;
-var s = String(uuid);
-if (s.startsWith('http')) return s;
-size = size || 320;
-return 'https://resources.tidal.com/images/' + s.replace(/-/g, '/') + '/' + size + 'x' + size + '.jpg';
-}
-
 function trackDuration(t) { return (t && t.duration) ? Math.floor(t.duration) : undefined; }
 function trackArtist(t) {
 if (!t) return 'Unknown';
@@ -155,7 +88,7 @@ if (p.replayGain !== undefined) return false;
 if (p.peak !== undefined) return false;
 if (p.isrc !== undefined) return false;
 if (p.audioQuality !== undefined) return false;
-return !!(p.uuid || p.creator || p.squareImage || p.numberOfTracks !== undefined);
+return !!(p.uuid || p.creator || p.numberOfTracks !== undefined);
 }
 
 function artistRelevance(name, query) {
@@ -172,10 +105,6 @@ return 0;
 // Returns tracks with ISRC codes for exact matching downstream.
 async function deezerSearch(query, limit) {
   if (!query) return { tracks: [], albums: [], artists: [], playlists: [] };
-  
-  const cacheKey = 'dzsearch:' + query.toLowerCase() + ':' + limit;
-  const cached = cGet(cacheKey);
-  if (cached) return cached;
   
   try {
     const r = await axios.get('https://api.deezer.com/search', {
@@ -201,7 +130,6 @@ async function deezerSearch(query, limit) {
             id: abid,
             title: t.album.title || 'Unknown',
             artist: trackArtist(t),
-            artworkURL: t.album.cover_xl || t.album.cover_big || t.album.cover_medium || t.album.cover || null,
             trackCount: t.album.nb_tracks,
             year: t.album.release_date ? String(t.album.release_date).slice(0, 4) : undefined
           };
@@ -215,8 +143,7 @@ async function deezerSearch(query, limit) {
         if (!artistMap[arid]) {
           artistMap[arid] = {
             id: arid,
-            name: a.name || 'Unknown',
-            artworkURL: a.picture_xl || a.picture_big || a.picture_medium || a.picture || null
+            name: a.name || 'Unknown'
           };
         }
         artistHits[arid] = (artistHits[arid] || 0) + 1;
@@ -226,16 +153,12 @@ async function deezerSearch(query, limit) {
       const tArtist = trackArtist(t);
       const isrc = t.isrc || null;
       
-      // Cache metadata for stream resolution
-      cacheTrackMeta(String(t.id), tTitle, tArtist, isrc);
-      
       tracks.push({
         id: String(t.id),
         title: tTitle,
         artist: tArtist,
         album: t.album ? t.album.title : undefined,
         duration: t.duration || undefined,
-        artworkURL: t.album?.cover_xl || t.album?.cover_big || t.album?.cover_medium || t.album?.cover || null,
         isrc: isrc,
         format: 'flac'
       });
@@ -253,7 +176,6 @@ async function deezerSearch(query, limit) {
       playlists: []
     };
     
-    cSet(cacheKey, result, 300);
     return result;
   } catch(e) {
     console.warn('deezer: search error', e.message);
@@ -262,42 +184,7 @@ async function deezerSearch(query, limit) {
 }
 
 // deezerGetTrack: fetches a single track by ID to get full metadata including ISRC.
-async function deezerGetTrack(trackId) {
-  if (!trackId) return null;
-  
-  const cacheKey = 'dztrack:' + trackId;
-  const cached = cGet(cacheKey);
-  if (cached) return cached;
-  
-  try {
-    const r = await axios.get('https://api.deezer.com/track/' + trackId, {
-      headers: { 'User-Agent': UA },
-      timeout: 8000
-    });
-    
-    const t = r.data || {};
-    if (!t || !t.id) return null;
-    
-    const result = {
-      id: String(t.id),
-      title: t.title || 'Unknown',
-      artist: trackArtist(t),
-      isrc: t.isrc || null,
-      duration: t.duration || undefined,
-      album: t.album ? {
-        id: String(t.album.id),
-        title: t.album.title,
-        cover: t.album.cover_xl || t.album.cover_big || t.album.cover_medium || t.album.cover
-      } : null
-    };
-    
-    cSet(cacheKey, result, 3600);
-    return result;
-  } catch(e) {
-    console.warn('deezer: get track error', e.message);
-    return null;
-  }
-}
+// This function is no longer used - removed to simplify code
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
 // Races ALL instances in parallel (Promise.any) — first success wins.
@@ -368,15 +255,20 @@ return json.result ?? null;
 } catch(e) { return null; }
 }
 
-// Save title+artist+isrc to Redis keyed by TIDAL track id (TTL 24h)
-async function redisCacheTrackMeta(tid, title, artist, isrc) {
-if (!tid || !title) return;
-await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null }), 'EX', 86400);
+// Cache successful ISRC matches in Redis with 1 year TTL (ISRCs are permanent identifiers)
+async function redisCacheIsrcMatch(isrc, source, matchedId) {
+if (!isrc || !matchedId) return;
+const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const key = 'mc:isrc:' + norm(isrc);
+await upstashCmd('SET', key, JSON.stringify({ source, matchedId }), 'EX', 31536000);
 }
 
-// Load title+artist+isrc from Redis by TIDAL track id
-async function redisLoadTrackMeta(tid) {
-const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
+// Load cached ISRC match from Redis
+async function redisLoadIsrcMatch(isrc) {
+if (!isrc) return null;
+const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+const key = 'mc:isrc:' + norm(isrc);
+const raw = await upstashCmd('GET', key);
 if (!raw) return null;
 try { return JSON.parse(raw); } catch(e) { return null; }
 }
@@ -550,7 +442,7 @@ h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.
 h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
-h += '<footer>Claudochrome Eclipse Addon v2.4.0 &bull; Deezer catalog/artwork + Qobuz/TIDAL ISRC streams (30-day cache)</footer>';
+h += '<footer>Claudochrome Eclipse Addon v2.5.0 &bull; Deezer catalog + Qobuz/TIDAL ISRC streams (1-year Redis cache)</footer>';
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
 h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
@@ -612,8 +504,8 @@ return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/ma
 });
 
 app.get('/instances', async c => {
-  const cached = cGet('instances:health');
-  if (cached) return Response.json({ instances: cached, cached: true });
+  const cached = await upstashCmd('GET', 'instances:health');
+  if (cached) return Response.json({ instances: JSON.parse(cached), cached: true });
   const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
     const start = Date.now();
     try {
@@ -621,12 +513,12 @@ app.get('/instances', async c => {
       return { url: inst, ok: true, ms: Date.now() - start };
     } catch(e) { return { url: inst, ok: false, ms: null }; }
   }));
-  cSet('instances:health', results, 30); // cache 30s — prevents 12-req burst per poll
+  await upstashCmd('SET', 'instances:health', JSON.stringify(results), 'EX', 30);
   return Response.json({ instances: results });
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.4.1', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.5.0', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
@@ -645,27 +537,12 @@ types: ['track', 'album', 'artist', 'playlist']
 });
 });
 
-// ─── Search — Deezer catalog + cache track meta for stream ─────────────────────
+// ─── Search — Deezer catalog only (no caching) ─────────────────────
 app.get('/u/:token/search', async c => {
 return withToken(c, async entry => {
 const q = String(c.req.query('q') || c.req.query('query') || c.req.query('s') || '').trim();
 const limit = Math.min(parseInt(c.req.query('limit') || '20', 10) || 20, 50);
-const inst = entry.instanceUrl;
 if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
-
-const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
-  // In-memory cache check (fast path — avoids Upstash round-trip)
-  const memCached = cGet(cacheKey);
-  if (memCached) return Response.json(memCached);
-  const cached = await upstashCmd('GET', cacheKey);
-if (cached) {
-try {
-const parsed = JSON.parse(cached);
-// Re-populate in-memory meta cache from cached search results
-if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title) cacheTrackMeta(t.id, t.title, t.artist); });
-return Response.json(parsed);
-} catch(e) {}
-}
 
 try {
 // Use Deezer as the primary catalog/search source
@@ -676,8 +553,6 @@ const artists = deezerResults.artists || [];
 const playlists = deezerResults.playlists || [];
 
 const result = { tracks, albums, artists, playlists };
-  cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
-  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
 return Response.json(result);
 } catch(e) {
 return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
@@ -688,10 +563,6 @@ return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums:
 // ─── Qobuz client — ISRC exact match for stream resolution ────────────────────
 async function qobuzSearchByIsrc(isrc, limit) {
   if (!isrc) return [];
-  
-  const cacheKey = 'qbzisrc:' + isrc.toUpperCase() + ':' + limit;
-  const cached = cGet(cacheKey);
-  if (cached) return cached;
   
   try {
     const r = await axios.get(activeQobuzInstance + '/search', {
@@ -712,12 +583,10 @@ async function qobuzSearchByIsrc(isrc, limit) {
         isrc: t.isrc || null,
         duration: t.duration || undefined,
         album: t.album?.title || undefined,
-        artworkURL: t.album?.image?.large || t.album?.image?.small || null,
         format: 'flac'
       };
     }).filter(Boolean);
     
-    cSet(cacheKey, tracksData, 300);
     return tracksData;
   } catch(e) {
     console.warn('qobuz: ISRC search error', e.message);
@@ -738,20 +607,10 @@ return dedupeCall('stream:' + tid + ':' + (inst || 'pool'), async () => {
 let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
 
-// Step 2: look up from in-memory cache (populated at search time)
+// Step 2: get ISRC from query params
 let qIsrc = String(c.req.query('isrc') || '').trim() || null;
-if (!qTitle) {
-const mem = getCachedMeta(tid);
-if (mem) { qTitle = mem.title; qArtist = mem.artist; if (!qIsrc) qIsrc = mem.isrc || null; console.log('meta: hit in-memory cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
-}
 
-// Step 3: look up from Redis (survives across worker instances / restarts)
-if (!qTitle) {
-const redisMeta = await redisLoadTrackMeta(tid);
-if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsrc) qIsrc = redisMeta.isrc || null; console.log('meta: hit Redis cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
-}
-
-if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping ISRC lookup');
+if (!qTitle && !qIsrc) console.log('meta: no query params for tid', tid, '- skipping ISRC lookup');
 
 // Step 4: Qobuz — ISRC exact match ONLY (no fuzzy matching)
 if (qIsrc) {
@@ -759,8 +618,8 @@ try {
 const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const wantIsrc = norm(qIsrc);
 
-// Check cache for successful ISRC match first
-const cachedMatch = getCachedIsrcMatch(qIsrc);
+// Check Redis cache for successful ISRC match first
+const cachedMatch = await redisLoadIsrcMatch(qIsrc);
 let exactMatch = null;
 
 if (cachedMatch && cachedMatch.source === 'qobuz') {
@@ -777,8 +636,8 @@ exactMatch = qobuzTracks.find(t => t.isrc && norm(t.isrc) === wantIsrc);
 
 if (exactMatch && exactMatch.id) {
 console.log('qobuz: ISRC EXACT MATCH', qIsrc, '->', exactMatch.id, exactMatch.title);
-// Cache the successful match
-cacheIsrcMatch(qIsrc, 'qobuz', exactMatch.id);
+// Cache the successful match in Redis
+await redisCacheIsrcMatch(qIsrc, 'qobuz', exactMatch.id);
 // Get stream URL via Qobuz API instance /stream endpoint
 try {
 const qStream = await axios.get(activeQobuzInstance + '/stream/' + exactMatch.id, {
@@ -788,7 +647,7 @@ timeout: 8000
 });
 if (qStream.data && qStream.data.url) {
 const qQuality = qStream.data.bit_depth >= 24 ? 'hires' : (qStream.data.bit_depth >= 16 ? 'lossless' : 'standard');
-return Response.json({ url: qStream.data.url, format: 'flac', quality: qQuality, source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+return Response.json({ url: qStream.data.url, format: 'flac', quality: qQuality, source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000 + 1680) });
 }
 } catch(e) {
 console.warn('qobuz: stream URL fetch error', e.message);
@@ -807,7 +666,6 @@ const deezerResults = await deezerSearch((qArtist ? qArtist + ' ' : '') + qTitle
 const tracks = deezerResults.tracks || [];
 if (tracks.length > 0 && tracks[0].isrc) {
 qIsrc = tracks[0].isrc;
-cacheTrackMeta(tid, qTitle, qArtist, qIsrc);
 console.log('deezer: enriched ISRC from catalog search', qTitle, '->', qIsrc);
 }
 } catch(e) {
@@ -826,8 +684,8 @@ try {
 const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const wantIsrc = norm(qIsrc);
 
-// Check cache for successful TIDAL ISRC match first
-const cachedTidalMatch = getCachedIsrcMatch(qIsrc);
+// Check Redis cache for successful TIDAL ISRC match first
+const cachedTidalMatch = await redisLoadIsrcMatch(qIsrc);
 let tidalExactMatch = null;
 
 if (cachedTidalMatch && cachedTidalMatch.source === 'tidal') {
@@ -843,28 +701,29 @@ tidalExactMatch = tracks.find(t => t.isrc && norm(t.isrc) === wantIsrc);
 
 if (tidalExactMatch && tidalExactMatch.id) {
 console.log('tidal: ISRC EXACT MATCH', qIsrc, '->', tidalExactMatch.id);
-// Cache the successful match
-cacheIsrcMatch(qIsrc, 'tidal', tidalExactMatch.id);
+// Cache the successful match in Redis
+await redisCacheIsrcMatch(qIsrc, 'tidal', tidalExactMatch.id);
 // Try to get stream using the matched TIDAL track ID
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
 try {
 const data = await hifiGetForToken(inst, '/track', { id: String(tidalExactMatch.id), quality: ql });
 const payload = data && data.data ? data.data : data;
+
+
 if (payload && payload.manifest) {
 const decoded = decodeManifest(payload.manifest);
 if (decoded && decoded.url) {
 const codec = (decoded.codec || '').toLowerCase();
 const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
 const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 3600) });
 }
 }
 if (payload && payload.url) {
 const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
 const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 3600) });
 }
 } catch(e) {
 // Continue to next quality
@@ -935,18 +794,15 @@ try {
   const artistName = album?.artist?.name
     || album?.artists?.map(a => a.name).join(', ')
     || 'Unknown';
-  const cover = album?.cover || album?.image || album?.artwork;
   const tracks = rawItems.map((item, i) => {
     const t = item?.item || item;
     // Don't hard-filter on streamReady — TIDAL sometimes incorrectly marks playable tracks false
     if (!t || !t.id) return null;
     const tTitle = t.title || 'Unknown';
     const tArtist = trackArtist(t) || artistName;
-    cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-    redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080) };
+    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1 };
   }).filter(Boolean);
-  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
+  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
   return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
 }
@@ -1015,10 +871,6 @@ app.get('/u/:token/artist/:id', async c => {
       }
 
       const artistName = artistInfo.name || 'Unknown';
-      const coverData  = infoD.cover;
-      const artworkURL = coverData
-        ? (coverData[750] || coverData[480] || coverData[320])
-        : coverUrl(artistInfo.picture, 480);
 
       // ── Step 3: Merge albums from every source ────────────────────────────────
       const albumMap = {};
@@ -1120,7 +972,7 @@ app.get('/u/:token/artist/:id', async c => {
           if (t.album?.id && isMain(t)) {
             const alId = String(t.album.id);
             albumMap[alId] = albumMap[alId] || {
-              id: t.album.id, title: t.album.title, cover: t.album.cover,
+              id: t.album.id, title: t.album.title,
               releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks,
             };
           }
@@ -1142,12 +994,9 @@ app.get('/u/:token/artist/:id', async c => {
         .map(t => {
           const tTitle  = t.title || 'Unknown';
           const tArtist = trackArtist(t) || artistName;
-          cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-          redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
           return {
             id: String(t.id), title: tTitle, artist: tArtist,
             duration: trackDuration(t),
-            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1080),
           };
         });
 
@@ -1161,14 +1010,13 @@ app.get('/u/:token/artist/:id', async c => {
         })
         .map(al => ({
           id: String(al.id), title: al.title || 'Unknown', artist: artistName,
-          artworkURL: coverUrl(al.cover || al.image || al.artwork, 1080),
           trackCount: al.numberOfTracks,
           year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
         }));
 
       return Response.json({
         id: String(artistInfo.id || aid), name: artistName,
-        artworkURL, bio: null, topTracks, albums,
+        bio: null, topTracks, albums,
       });
     } catch(e) {
       return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
@@ -1195,11 +1043,9 @@ const t = item.item || item;
 if (!t || !t.id || t.streamReady === false) return null;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080) };
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t) };
 }).filter(Boolean);
-return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
+return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
 return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status: 502 });
 }
