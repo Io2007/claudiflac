@@ -603,7 +603,7 @@ async function qobuzSearchByIsrc(isrc, limit) {
       };
     }).filter(Boolean);
     
-    return tracksData;
+    return items;
   } catch(e) {
     console.warn('qobuz: ISRC search error', e.message);
     return [];
@@ -638,7 +638,11 @@ const wantIsrc = norm(qIsrc);
 const cachedMatch = await redisLoadIsrcMatch(qIsrc);
 let exactMatch = null;
 
-if (cachedMatch && cachedMatch.source === 'qobuz') {
+// If cached match is TIDAL, skip Qobuz entirely and go straight to TIDAL
+if (cachedMatch && cachedMatch.source === 'tidal') {
+console.log('isrc cache HIT (tidal)', qIsrc, '->', cachedMatch.matchedId, '- skipping qobuz');
+// Don't set exactMatch here - let TIDAL section handle it
+} else if (cachedMatch && cachedMatch.source === 'qobuz') {
 console.log('qobuz: ISRC cache HIT', qIsrc, '->', cachedMatch.matchedId);
 // Fetch track details to get title for logging
 const qobuzTracks = await qobuzSearchByIsrc(qIsrc, 10);
@@ -708,8 +712,8 @@ if (cachedTidalMatch && cachedTidalMatch.source === 'tidal') {
 console.log('tidal: ISRC cache HIT', qIsrc, '->', cachedTidalMatch.matchedId);
 // Use cached matched ID directly
 tidalExactMatch = { id: cachedTidalMatch.matchedId };
-} else {
-// Search TIDAL by ISRC using hifi API
+} else if (!cachedTidalMatch || cachedTidalMatch.source !== 'tidal') {
+// Search TIDAL by ISRC using hifi API (only if not already cached as tidal)
 const tidalSearchResult = await hifiGetForToken(inst, '/search', { query: 'isrc:' + qIsrc, limit: 10 });
 const tracks = tidalSearchResult?.tracks?.items || tidalSearchResult?.tracks || [];
 tidalExactMatch = tracks.find(t => t.isrc && norm(t.isrc) === wantIsrc);
@@ -717,8 +721,10 @@ tidalExactMatch = tracks.find(t => t.isrc && norm(t.isrc) === wantIsrc);
 
 if (tidalExactMatch && tidalExactMatch.id) {
 console.log('tidal: ISRC EXACT MATCH', qIsrc, '->', tidalExactMatch.id);
-// Cache the successful match in Redis
+// Cache the successful match in Redis (only if not already cached as tidal)
+if (!cachedTidalMatch || cachedTidalMatch.source !== 'tidal') {
 await redisCacheIsrcMatch(qIsrc, 'tidal', tidalExactMatch.id);
+}
 // Try to get stream using the matched TIDAL track ID
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
