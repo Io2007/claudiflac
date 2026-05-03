@@ -563,9 +563,30 @@ if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [
 try {
 // Use Deezer as the primary catalog/search source
 const deezerResults = await deezerSearch(q, limit);
-const tracks = deezerResults.tracks || [];
-const albums = deezerResults.albums || [];
-const artists = deezerResults.artists || [];
+const tracks = (deezerResults.tracks || []).map(t => ({
+id: t.id,
+title: t.title,
+artist: t.artist,
+album: t.album,
+duration: t.duration,
+isrc: t.isrc,
+format: t.format,
+artworkURL: t.artwork ? t.artwork.replace('/250x250-', '/500x500-') : undefined
+}));
+const albums = (deezerResults.albums || []).map(a => ({
+id: a.id,
+title: a.title,
+artist: a.artist,
+artworkURL: a.artwork,
+trackCount: a.trackCount,
+year: a.year
+}));
+const artists = (deezerResults.artists || []).map(a => ({
+id: a.id,
+name: a.name,
+artworkURL: a.artwork,
+genres: []
+}));
 const playlists = deezerResults.playlists || [];
 
 const result = { tracks, albums, artists, playlists };
@@ -822,9 +843,25 @@ try {
     if (!t || !t.id) return null;
     const tTitle = t.title || 'Unknown';
     const tArtist = trackArtist(t) || artistName;
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1 };
+    return { 
+      id: String(t.id), 
+      title: tTitle, 
+      artist: tArtist, 
+      duration: trackDuration(t), 
+      trackNumber: t.trackNumber || i + 1,
+      artworkURL: album?.imageCover || undefined,
+      streamURL: undefined
+    };
   }).filter(Boolean);
-  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
+  return Response.json({ 
+    id: String(album?.id || aid), 
+    title: album?.title || 'Unknown', 
+    artist: artistName, 
+    artworkURL: album?.imageCover || undefined,
+    year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, 
+    trackCount: album?.numberOfTracks || tracks.length, 
+    tracks 
+  });
 } catch(e) {
   return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
 }
@@ -1037,8 +1074,13 @@ app.get('/u/:token/artist/:id', async c => {
         }));
 
       return Response.json({
-        id: String(artistInfo.id || aid), name: artistName,
-        bio: null, topTracks, albums,
+        id: String(artistInfo.id || aid), 
+        name: artistName,
+        artworkURL: artistInfo.picture || undefined,
+        bio: null, 
+        genres: [],
+        topTracks: topTracks.map(t => ({...t, streamURL: undefined})), 
+        albums: albums.map(a => ({...a, artworkURL: undefined}))
       });
     } catch(e) {
       return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
