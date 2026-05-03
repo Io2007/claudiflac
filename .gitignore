@@ -1,8 +1,10 @@
 ```
+# Dependencies
+node_modules/
+
 # Logs and temp files
 *.log
 *.tmp
-*.swp
 
 # Environment
 .env
@@ -13,29 +15,10 @@
 .vscode/
 .idea/
 
-# Dependencies
-node_modules/
-.venv/
-venv/
-__pycache__/
-.mypy_cache/
-.pytest_cache/
-pip-log.txt
-pipenv.lock
-
-# Build artifacts
+# Build outputs
 dist/
 build/
-*.pyc
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-.coverage
 coverage/
 htmlcov/
-
-# OS generated files
-.DS_Store
-Thumbs.db
+.nyc_output/
 ```

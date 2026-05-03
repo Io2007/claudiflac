@@ -2,6 +2,7 @@
   "name": "spotiflac-eclipse",
   "version": "5.5.0",
   "description": "SpotiFLAC — Deezer search + Claudochrome FLAC streams for Eclipse",
+  "type": "module",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
