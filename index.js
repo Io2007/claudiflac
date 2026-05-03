@@ -30,8 +30,8 @@ let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 const QOBUZ_INSTANCES = [
-'https://qobuz-api1.onrender.com',
 'https://qobuz-api.stremio123.duckdns.org',
+'https://qobuz-api1.onrender.com',
 ];
 let activeQobuzInstance = QOBUZ_INSTANCES[0];
 
@@ -131,7 +131,8 @@ async function deezerSearch(query, limit) {
             title: t.album.title || 'Unknown',
             artist: trackArtist(t),
             trackCount: t.album.nb_tracks,
-            year: t.album.release_date ? String(t.album.release_date).slice(0, 4) : undefined
+            year: t.album.release_date ? String(t.album.release_date).slice(0, 4) : undefined,
+            md5: t.album.md5_image || null
           };
         }
       }
@@ -152,6 +153,7 @@ async function deezerSearch(query, limit) {
       const tTitle = t.title || 'Unknown';
       const tArtist = trackArtist(t);
       const isrc = t.isrc || null;
+      const artwork = t.album?.cover_medium || t.album?.cover_big || t.album?.cover_small || null;
       
       tracks.push({
         id: String(t.id),
@@ -160,19 +162,33 @@ async function deezerSearch(query, limit) {
         album: t.album ? t.album.title : undefined,
         duration: t.duration || undefined,
         isrc: isrc,
-        format: 'flac'
+        format: 'flac',
+        artwork: artwork
       });
     }
     
+    // Build sorted artist list with relevance scoring
     const artistList = Object.keys(artistMap)
       .sort((a, b) => (artistRelevance(artistMap[b].name, query) * 100 + (artistHits[b] || 0)) - 
                        (artistRelevance(artistMap[a].name, query) * 100 + (artistHits[a] || 0)))
       .slice(0, 5).map(k => artistMap[k]);
     
+    // Add artwork URLs to albums using md5_image from Deezer
+    const albumList = Object.values(albumMap).slice(0, 8).map(album => ({
+      ...album,
+      artwork: `https://cdn-images.dzcdn.net/images/cover/${album.md5 || ''}/500x500-000000-80-0-0.jpg`
+    }));
+    
+    // Add artwork URLs to artists
+    const artistListWithArtwork = artistList.map(artist => ({
+      ...artist,
+      artwork: `https://cdn-images.dzcdn.net/images/artist/${artist.id}/500x500-000000-80-0-0.jpg`
+    }));
+    
     const result = {
       tracks,
-      albums: Object.values(albumMap).slice(0, 8),
-      artists: artistList,
+      albums: albumList,
+      artists: artistListWithArtwork,
       playlists: []
     };
     
